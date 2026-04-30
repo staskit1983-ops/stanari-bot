@@ -1,206 +1,149 @@
 """
-STAN ARI Book Bot — final buttons version
+STAN ARI Book Bot — READY DROP-IN VERSION
+Просто замінити файли в GitHub і запустити.
 
-ENV variables:
-BOT_TOKEN=your_new_token
-CHANNEL_USERNAME=@Stan_Ari
-SITE_URL=https://stanari.art
-GUMROAD_URL=https://staskit.gumroad.com/l/lpkwbc
-DONATE_URL=https://send.monobank.ua/jar/AUje48FJ8f
-ADMIN_ID=your_telegram_id
-FIREBASE_SERVICE_ACCOUNT_JSON={...firebase service account json...}
+Що вміє:
+- перевіряє підписку на Telegram канал
+- видає унікальний промокод із локального списку
+- кнопки: сайт, купити книгу, донат, канал
 """
 
-import os
-import json
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import json
+import os
+from datetime import datetime
 
-import firebase_admin
-from firebase_admin import credentials, firestore
+TOKEN = "8653793852:AAGN_tdPSU-JTg6AV6rCrkfUeLm9vEcHS5s"
 
+CHANNEL_USERNAME = "@Stan_Ari"
+CHANNEL_URL = "https://t.me/Stan_Ari"
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@Stan_Ari").strip()
-SITE_URL = os.getenv("SITE_URL", "https://stanari.art").strip().rstrip("/")
-GUMROAD_URL = os.getenv("GUMROAD_URL", "https://staskit.gumroad.com/l/lpkwbc").strip()
-DONATE_URL = os.getenv("DONATE_URL", "https://send.monobank.ua/jar/AUje48FJ8f").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
-CHANNEL_URL = "https://t.me/" + CHANNEL_USERNAME.lstrip("@")
+SITE_URL = "https://stanari.art"
+READER_URL = "https://stanari.art/reader.html"
+BUY_URL = "https://staskit.gumroad.com/l/lpkwbc"
+DONATE_URL = "https://send.monobank.ua/jar/AUje48FJ8f"
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing.")
+STATS_FILE = "bot_stats.json"
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
 
-def init_firebase():
-    if firebase_admin._apps:
-        return firestore.client()
+def load_stats():
+    if os.path.exists(STATS_FILE):
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-    service_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    if service_json:
-        cred = credentials.Certificate(json.loads(service_json))
-    elif os.path.exists("serviceAccountKey.json"):
-        cred = credentials.Certificate("serviceAccountKey.json")
-    else:
-        raise RuntimeError("Firebase credentials missing.")
-
-    firebase_admin.initialize_app(cred)
-    return firestore.client()
-
-
-db = init_firebase()
+    return {
+        "users": {},
+        "issued": {
+            "tiktok": 0,
+            "youtube": 0,
+            "telegram": 0
+        }
+    }
 
 
-def detect_source(message_text):
-    parts = (message_text or "").split()
+def save_stats(stats):
+    with open(STATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def detect_source(text):
+    parts = (text or "").split()
     if len(parts) < 2:
         return "telegram"
 
     p = parts[1].lower()
+
     if "tik" in p or "tt" in p:
         return "tiktok"
     if "you" in p or "yt" in p:
         return "youtube"
     if "tg" in p or "tele" in p:
         return "telegram"
+
     return "telegram"
+
+
+def make_code(source, number):
+    if source == "tiktok":
+        return f"tt{number:04d}"
+    if source == "youtube":
+        return f"yt{number:04d}"
+    return f"tg{number:04d}"
 
 
 def is_subscribed(user_id):
     try:
         member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in ("member", "administrator", "creator")
+        return member.status in ["member", "administrator", "creator"]
     except Exception:
         return False
 
 
-def get_bot_user(user_id):
-    snap = db.collection("botUsers").document(str(user_id)).get()
-    return snap.to_dict() if snap.exists else None
+def get_or_issue_code(user, source):
+    stats = load_stats()
+    uid = str(user.id)
 
+    if uid in stats["users"] and stats["users"][uid].get("code"):
+        return stats["users"][uid]["code"]
 
-def save_bot_user(user, source, promo_code=None):
-    data = {
-        "telegramUserId": user.id,
+    stats["issued"][source] = stats["issued"].get(source, 0) + 1
+    number = stats["issued"][source]
+    code = make_code(source, number)
+
+    stats["users"][uid] = {
+        "telegram_id": user.id,
         "username": user.username or "",
-        "firstName": user.first_name or "",
-        "lastName": user.last_name or "",
+        "first_name": user.first_name or "",
         "source": source,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "code": code,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
     }
-    if promo_code:
-        data["promoCode"] = promo_code
-        data["codeIssuedAt"] = firestore.SERVER_TIMESTAMP
 
-    db.collection("botUsers").document(str(user.id)).set(data, merge=True)
-
-
-def find_free_code(source):
-    query = (
-        db.collection("promoCodes")
-        .where("used", "==", False)
-        .where("accessType", "==", "free_book")
-        .where("source", "==", source)
-        .limit(30)
-    )
-
-    for doc in query.stream():
-        data = doc.to_dict() or {}
-        if data.get("reserved") is True:
-            continue
-        return doc.id
-    return None
-
-
-def issue_code_for_user(user, source):
-    existing = get_bot_user(user.id)
-    if existing and existing.get("promoCode"):
-        return existing["promoCode"], False
-
-    code_id = find_free_code(source)
-    if not code_id and source != "telegram":
-        code_id = find_free_code("telegram")
-        source = "telegram"
-
-    if not code_id:
-        return None, False
-
-    code_ref = db.collection("promoCodes").document(code_id)
-    user_ref = db.collection("botUsers").document(str(user.id))
-
-    @firestore.transactional
-    def reserve(transaction):
-        snap = code_ref.get(transaction=transaction)
-        if not snap.exists:
-            return None
-
-        data = snap.to_dict() or {}
-        if data.get("used") is True or data.get("reserved") is True:
-            return None
-
-        transaction.update(code_ref, {
-            "reserved": True,
-            "reservedByTelegramId": user.id,
-            "reservedByUsername": user.username or "",
-            "reservedAt": firestore.SERVER_TIMESTAMP,
-        })
-
-        transaction.set(user_ref, {
-            "telegramUserId": user.id,
-            "username": user.username or "",
-            "firstName": user.first_name or "",
-            "lastName": user.last_name or "",
-            "source": source,
-            "promoCode": code_id,
-            "codeIssuedAt": firestore.SERVER_TIMESTAMP,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-        }, merge=True)
-
-        return code_id
-
-    transaction = db.transaction()
-    reserved_code = reserve(transaction)
-    return reserved_code, True
-
-
-def subscribe_keyboard():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("📢 Підписатися на канал", url=CHANNEL_URL))
-    kb.add(InlineKeyboardButton("✅ Перевірити підписку", callback_data="check_sub"))
-    return kb
+    save_stats(stats)
+    return code
 
 
 def main_keyboard():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🎁 Отримати код доступу", callback_data="get_code"))
-    kb.add(InlineKeyboardButton("📖 Купити книгу", url=GUMROAD_URL))
-    kb.add(InlineKeyboardButton("💛 Донат Monobank", url=DONATE_URL))
-    kb.add(InlineKeyboardButton("🌐 Сайт автора", url=SITE_URL))
-    kb.add(InlineKeyboardButton("📢 Telegram канал", url=CHANNEL_URL))
+    kb = telebot.types.InlineKeyboardMarkup()
+    kb.row(telebot.types.InlineKeyboardButton("🎁 Отримати код доступу", callback_data="get_code"))
+    kb.row(telebot.types.InlineKeyboardButton("📖 Купити книгу", url=BUY_URL))
+    kb.row(telebot.types.InlineKeyboardButton("💛 Донат Monobank", url=DONATE_URL))
+    kb.row(
+        telebot.types.InlineKeyboardButton("🌐 Сайт автора", url=SITE_URL),
+        telebot.types.InlineKeyboardButton("📢 Telegram канал", url=CHANNEL_URL)
+    )
+    return kb
+
+
+def subscribe_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup()
+    kb.row(telebot.types.InlineKeyboardButton("📢 Підписатися на канал", url=CHANNEL_URL))
+    kb.row(telebot.types.InlineKeyboardButton("✅ Перевірити підписку", callback_data="check_sub"))
     return kb
 
 
 def code_keyboard():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🌐 Ввести код на сайті", url=SITE_URL))
-    kb.add(InlineKeyboardButton("📖 Читати книгу", url=SITE_URL + "/reader.html"))
-    kb.add(InlineKeyboardButton("📖 Купити книгу", url=GUMROAD_URL))
-    kb.add(InlineKeyboardButton("💛 Донат Monobank", url=DONATE_URL))
-    kb.add(InlineKeyboardButton("📢 Telegram канал", url=CHANNEL_URL))
+    kb = telebot.types.InlineKeyboardMarkup()
+    kb.row(telebot.types.InlineKeyboardButton("🌐 Ввести код на сайті", url=SITE_URL))
+    kb.row(telebot.types.InlineKeyboardButton("📖 Читати книгу", url=READER_URL))
+    kb.row(telebot.types.InlineKeyboardButton("📖 Купити книгу", url=BUY_URL))
+    kb.row(telebot.types.InlineKeyboardButton("💛 Донат Monobank", url=DONATE_URL))
+    kb.row(telebot.types.InlineKeyboardButton("📢 Telegram канал", url=CHANNEL_URL))
     return kb
 
 
-def send_welcome(chat_id, first_name=""):
-    name = ", " + first_name if first_name else ""
+def send_welcome(chat_id, name=""):
+    hello = f"Привіт, {name}! 👋\n\n" if name else "Привіт! 👋\n\n"
+
     bot.send_message(
         chat_id,
-        "Привіт" + name + "! 👋\n\n"
+        hello +
         "<b>STAN ARI — The Life Operator</b>\n\n"
         "Тут ти можеш отримати персональний код доступу до онлайн-читання книги.\n\n"
         "Також можеш купити повну книгу або підтримати фонд Aria.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard()
     )
 
 
@@ -209,35 +152,24 @@ def send_not_subscribed(chat_id):
         chat_id,
         "❌ <b>Схоже, ти ще не підписався</b>\n\n"
         "Підпишись на Telegram канал і натисни «Перевірити підписку».",
-        reply_markup=subscribe_keyboard(),
+        reply_markup=subscribe_keyboard()
     )
 
 
 def send_code(chat_id, user, source):
-    code, is_new = issue_code_for_user(user, source)
-
-    if not code:
-        bot.send_message(
-            chat_id,
-            "⚠️ Зараз немає вільних кодів для видачі. "
-            "Спробуй пізніше або напиши автору.",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    save_bot_user(user, source, code)
+    code = get_or_issue_code(user, source)
 
     bot.send_message(
         chat_id,
         "✅ <b>Твій код доступу готовий</b>\n\n"
-        "🔑 Код: <code>" + code + "</code>\n\n"
+        f"🔑 Код: <code>{code}</code>\n\n"
         "Що робити далі:\n"
         "1. Перейди на сайт\n"
         "2. Натисни «Читати книгу»\n"
         "3. Увійди через Google\n"
         "4. Введи код\n\n"
         "🐾 33% прибутку йде у фонд Aria та майбутній притулок для тварин.",
-        reply_markup=code_keyboard(),
+        reply_markup=code_keyboard()
     )
 
 
@@ -248,7 +180,6 @@ user_sources = {}
 def start(message):
     source = detect_source(message.text)
     user_sources[message.from_user.id] = source
-    save_bot_user(message.from_user, source)
     send_welcome(message.chat.id, message.from_user.first_name or "")
 
 
@@ -280,13 +211,16 @@ def check_sub(call):
 
 
 @bot.message_handler(commands=["mycode"])
-def my_code(message):
-    existing = get_bot_user(message.from_user.id)
-    if existing and existing.get("promoCode"):
+def mycode(message):
+    stats = load_stats()
+    uid = str(message.from_user.id)
+
+    if uid in stats["users"] and stats["users"][uid].get("code"):
+        code = stats["users"][uid]["code"]
         bot.send_message(
             message.chat.id,
-            "🔑 Твій код: <code>" + existing["promoCode"] + "</code>",
-            reply_markup=code_keyboard(),
+            f"🔑 Твій код: <code>{code}</code>",
+            reply_markup=code_keyboard()
         )
     else:
         bot.send_message(message.chat.id, "У тебе ще немає коду. Натисни /start")
@@ -294,29 +228,17 @@ def my_code(message):
 
 @bot.message_handler(commands=["stats"])
 def stats(message):
-    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
-        return
-
-    users = list(db.collection("botUsers").stream())
-    total = len(users)
-    with_code = 0
-    sources = {}
-
-    for snap in users:
-        data = snap.to_dict() or {}
-        src = data.get("source", "unknown")
-        sources[src] = sources.get(src, 0) + 1
-        if data.get("promoCode"):
-            with_code += 1
-
-    source_text = "\n".join([str(k) + ": " + str(v) for k, v in sources.items()]) or "—"
+    stats = load_stats()
+    total_users = len(stats.get("users", {}))
+    issued = stats.get("issued", {})
 
     bot.send_message(
         message.chat.id,
         "📊 <b>Статистика</b>\n\n"
-        "👥 Користувачів: <b>" + str(total) + "</b>\n"
-        "🔑 Отримали код: <b>" + str(with_code) + "</b>\n\n"
-        "Джерела:\n" + source_text
+        f"👥 Користувачів: <b>{total_users}</b>\n"
+        f"TikTok: {issued.get('tiktok', 0)}\n"
+        f"YouTube: {issued.get('youtube', 0)}\n"
+        f"Telegram: {issued.get('telegram', 0)}"
     )
 
 
@@ -326,5 +248,5 @@ def fallback(message):
 
 
 if __name__ == "__main__":
-    print("🤖 STAN ARI Bot started")
+    print("🤖 STAN ARI Book Bot started")
     bot.infinity_polling(skip_pending=True)
